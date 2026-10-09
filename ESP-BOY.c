@@ -1,4 +1,4 @@
-// ESP-BOY DEV - boot: init SD + schermata info se SD assente/vuota
+// ESP-BOY DEV - boot: init SD + legge il primo .bin e ne mostra il testo in verde
 // Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD e' nel core ESP32)
 
 #include <SPI.h>
@@ -11,10 +11,8 @@
 #define TFT_RST  4
 #define SD_CS    5
 
-// Il tuo pannello e' nativamente 320x240 (landscape): con rotazione 0 la
-// libreria pero' crede di avere 240x320, quindi scriveva solo 240 colonne
-// (fascia di rumore a destra) e Y oltre 240 andava a capo (messaggio nel
-// punto sbagliato). Questa classe forza le dimensioni reali 320x240.
+// Pannello nativo 320x240: con rotazione 0 la libreria crede di avere
+// 240x320, quindi forziamo le dimensioni reali.
 class EspBoyTFT : public Adafruit_ILI9341 {
  public:
   EspBoyTFT(int8_t cs, int8_t dc, int8_t rst) : Adafruit_ILI9341(cs, dc, rst) {}
@@ -32,6 +30,7 @@ EspBoyTFT tft(TFT_CS, TFT_DC, TFT_RST);
 #define COLOR_BG     ILI9341_BLACK
 #define COLOR_TXT    ILI9341_GREEN
 #define COLOR_MSG    ILI9341_WHITE
+#define COLOR_ERR    ILI9341_RED
 
 void drawBootScreen(const char* msg) {
   tft.fillScreen(COLOR_BG);
@@ -97,15 +96,40 @@ String findExecutable() {
   return "";
 }
 
-void runExecutable(const String& path) {
+// Mostra una scritta centrata, con la dimensione piu' grande che ci sta
+void drawCenteredText(const String& text, uint16_t color) {
+  int len = text.length();
+  int sz = 4;
+  while (sz > 1 && len * 6 * sz > 300) sz--;
+
+  int w = len * 6 * sz;
+  int h = 8 * sz;
+
   tft.fillScreen(COLOR_BG);
-  tft.setTextColor(COLOR_TXT);
-  tft.setTextSize(2);
-  tft.setCursor(20, 20);
-  tft.print("Avvio:");
-  tft.setCursor(20, 50);
-  tft.setTextSize(1);
-  tft.print(path);
+  tft.setTextWrap(false);
+  tft.setTextColor(color);
+  tft.setTextSize(sz);
+  tft.setCursor((tft.width() - w) / 2, (tft.height() - h) / 2);
+  tft.print(text);
+}
+
+void runExecutable(const String& path) {
+  File f = SD.open(path);
+  if (!f) {
+    drawCenteredText("ERRORE LETTURA", COLOR_ERR);
+    return;
+  }
+
+  String content = f.readStringUntil('\n');
+  f.close();
+  content.trim();
+
+  if (content.length() == 0) {
+    drawCenteredText("FILE VUOTO", COLOR_ERR);
+    return;
+  }
+
+  drawCenteredText(content, COLOR_TXT);
 }
 
 void setup() {
