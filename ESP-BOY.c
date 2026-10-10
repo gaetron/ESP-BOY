@@ -1,8 +1,13 @@
-// ESP-BOY DEV - boot: init SD + legge il primo .bin e ne mostra il testo in verde
-// Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD e' nel core ESP32)
+// ESP-BOY LAUNCHER - lancia il .bin presente sulla SD, senza menu
+// Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD, Update, Preferences sono nel core ESP32)
+// Strumenti > Partition Scheme: "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"
+// Il launcher si carica UNA volta via USB. I giochi vanno compilati con lo stesso schema.
 
 #include <SPI.h>
 #include <SD.h>
+#include <Update.h>
+#include <Preferences.h>
+#include "esp_ota_ops.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 
@@ -10,6 +15,10 @@
 #define TFT_DC   2
 #define TFT_RST  4
 #define SD_CS    5
+
+#define SCREEN_ROTATION 0
+#define TFT_SPI_HZ 16000000
+#define SD_SPI_HZ  10000000
 
 // Pannello nativo 320x240: con rotazione 0 la libreria crede di avere
 // 240x320, quindi forziamo le dimensioni reali.
@@ -22,16 +31,16 @@ class EspBoyTFT : public Adafruit_ILI9341 {
   }
 };
 
-#define SCREEN_ROTATION 0
-#define TFT_SPI_HZ 16000000
-
 EspBoyTFT tft(TFT_CS, TFT_DC, TFT_RST);
 
-#define COLOR_BG     ILI9341_BLACK
-#define COLOR_TXT    ILI9341_GREEN
-#define COLOR_MSG    ILI9341_WHITE
-#define COLOR_ERR    ILI9341_RED
+#define COLOR_BG   ILI9341_BLACK
+#define COLOR_TXT  ILI9341_GREEN
+#define COLOR_MSG  ILI9341_WHITE
+#define COLOR_ERR  ILI9341_RED
 
+// ---------------------------------------------------------------
+// Schermate
+// ---------------------------------------------------------------
 void drawBootScreen(const char* msg) {
   tft.fillScreen(COLOR_BG);
   tft.setTextWrap(false);
@@ -77,61 +86,196 @@ void drawBootScreen(const char* msg) {
   }
 }
 
-String findExecutable() {
+void showError(const String& msg) {
+  tft.fillScreen(COLOR_BG);
+  tft.setTextWrap(false);
+
+  tft.setTextColor(COLOR_ERR);
+  tft.setTextSize(3);
+  tft.setCursor(10, 40);
+  tft.print("ERRORE");
+
+  tft.setTextColor(COLOR_MSG);
+  tft.setTextSize(1);
+  tft.setCursor(10, 100);
+  tft.print(msg);
+
+  tft.setTextColor(COLOR_TXT);
+  tft.setCursor(10, 130);
+  tft.print("Spegni e riaccendi per riprovare");
+}
+
+const int BAR_X = 20;
+const int BAR_Y = 140;
+const int BAR_W = 280;
+const int BAR_H = 20;
+
+void drawProgressFrame(const String& name) {
+  tft.fillScreen(COLOR_BG);
+  tft.setTextWrap(false);
+
+  tft.setTextColor(COLOR_TXT);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("ESP-BOY");
+
+  tft.setTextSize(2);
+  tft.setCursor(10, 70);
+  tft.print("Caricamento...");
+
+  String shown = name;
+  if (shown.length() > 40) shown = shown.substring(0, 40);
+  tft.setTextColor(COLOR_MSG);
+  tft.setTextSize(1);
+  tft.setCursor(10, 105);
+  tft.print(shown);
+
+  tft.drawRect(BAR_X, BAR_Y, BAR_W, BAR_H, COLOR_MSG);
+}
+
+void drawProgress(int pct) {
+  int inner = BAR_W - 4;
+  int filled = (inner * pct) / 100;
+  tft.fillRect(BAR_X + 2, BAR_Y + 2, filled, BAR_H - 4, COLOR_TXT);
+
+  tft.fillRect(130, 175, 70, 16, COLOR_BG);
+  tft.setTextColor(COLOR_MSG);
+  tft.setTextSize(2);
+  tft.setCursor(130, 175);
+  tft.print(pct);
+  tft.print("%");
+}
+
+// ---------------------------------------------------------------
+// Ricerca del gioco sulla SD
+// ---------------------------------------------------------------
+bool isCandidate(const String& name, size_t sz) {
+  if (name.length() == 0 || name[0] == '.') return false;
+
+  String low = name;
+  low.toLowerCase();
+  if (!low.endsWith(".bin")) return false;
+
+  // scarta i binari che NON sono l'app: bootloader, tabella partizioni, merged
+  if (low.indexOf("bootloader") >= 0) return false;
+  if (low.indexOf("partitions") >= 0) return false;
+  if (low.indexOf("merged") >= 0) return false;
+
+  if (sz < 32768) return false;
+  return true;
+}
+
+bool findGame(String& path, size_t& size, String& sig) {
   File root = SD.open("/");
-  if (!root) return "";
+  if (!root) return false;
 
   File entry = root.openNextFile();
   while (entry) {
     String name = entry.name();
-    if (!entry.isDirectory() && name.endsWith(".bin")) {
-      entry.close();
-      root.close();
-      return "/" + name;
-    }
+    if (name.startsWith("/")) name = name.substring(1);
+
+    size_t sz = entry.size();
+    bool dir = entry.isDirectory();
+    unsigned long lw = (unsigned long)entry.getLastWrite();
     entry.close();
+
+    if (!dir && isCandidate(name, sz)) {
+      path = "/" + name;
+      size = sz;
+      sig = name + "|" + String((unsigned long)sz) + "|" + String(lw);
+      root.close();
+      return true;
+    }
     entry = root.openNextFile();
   }
   root.close();
-  return "";
+  return false;
 }
 
-// Mostra una scritta centrata, con la dimensione piu' grande che ci sta
-void drawCenteredText(const String& text, uint16_t color) {
-  int len = text.length();
-  int sz = 4;
-  while (sz > 1 && len * 6 * sz > 300) sz--;
-
-  int w = len * 6 * sz;
-  int h = 8 * sz;
-
-  tft.fillScreen(COLOR_BG);
-  tft.setTextWrap(false);
-  tft.setTextColor(color);
-  tft.setTextSize(sz);
-  tft.setCursor((tft.width() - w) / 2, (tft.height() - h) / 2);
-  tft.print(text);
+// ---------------------------------------------------------------
+// Copia SD -> flash (partizione OTA libera)
+// ---------------------------------------------------------------
+String updateErrorText() {
+  uint8_t e = Update.getError();
+  if (e == UPDATE_ERROR_MAGIC_BYTE) return String("File non valido: non e' un'app compilata");
+  if (e == UPDATE_ERROR_SPACE)      return String("Gioco troppo grande per la flash");
+  return String(Update.errorString());
 }
 
-void runExecutable(const String& path) {
+bool copyToFlash(const String& path, size_t size, const String& name) {
   File f = SD.open(path);
   if (!f) {
-    drawCenteredText("ERRORE LETTURA", COLOR_ERR);
-    return;
+    showError("Impossibile leggere il file");
+    return false;
   }
 
-  String content = f.readStringUntil('\n');
+  if (!Update.begin(size)) {
+    String msg = updateErrorText();
+    f.close();
+    showError(msg);
+    return false;
+  }
+
+  drawProgressFrame(name);
+  drawProgress(0);
+
+  static uint8_t buf[4096];
+  size_t done = 0;
+  int lastPct = 0;
+
+  while (done < size) {
+    size_t remaining = size - done;
+    size_t toRead = remaining < sizeof(buf) ? remaining : sizeof(buf);
+
+    size_t n = f.read(buf, toRead);
+    if (n == 0) {
+      Update.abort();
+      f.close();
+      showError("Lettura SD interrotta");
+      return false;
+    }
+
+    if (Update.write(buf, n) != n) {
+      String msg = updateErrorText();
+      Update.abort();
+      f.close();
+      showError(msg);
+      return false;
+    }
+
+    done += n;
+
+    int pct = (int)((done * 100UL) / size);
+    if (pct != lastPct) {
+      drawProgress(pct);
+      lastPct = pct;
+    }
+  }
+
   f.close();
-  content.trim();
 
-  if (content.length() == 0) {
-    drawCenteredText("FILE VUOTO", COLOR_ERR);
-    return;
+  if (!Update.end(true)) {
+    showError(updateErrorText());
+    return false;
   }
 
-  drawCenteredText(content, COLOR_TXT);
+  return true;
 }
 
+// ---------------------------------------------------------------
+// Avvio del gioco: imposta l'altra partizione come boot e riavvia
+// ---------------------------------------------------------------
+bool bootGame() {
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  if (other == NULL) return false;
+  if (esp_ota_set_boot_partition(other) != ESP_OK) return false;
+  ESP.restart();
+  return true;
+}
+
+// ---------------------------------------------------------------
+// Setup / Loop
+// ---------------------------------------------------------------
 void setup() {
   // Chip select alti prima di toccare il bus SPI condiviso
   pinMode(SD_CS, OUTPUT);
@@ -139,7 +283,7 @@ void setup() {
   pinMode(TFT_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
 
-  bool sdOk = SD.begin(SD_CS);
+  bool sdOk = SD.begin(SD_CS, SPI, SD_SPI_HZ);
 
   tft.begin(TFT_SPI_HZ);
   tft.setRotation(SCREEN_ROTATION);
@@ -151,13 +295,44 @@ void setup() {
     return;
   }
 
-  String exe = findExecutable();
-  if (exe == "") {
+  String path;
+  String sig;
+  size_t size = 0;
+
+  if (!findGame(path, size, sig)) {
     drawBootScreen("SD vuota: nessun eseguibile");
     return;
   }
 
-  runExecutable(exe);
+  Preferences prefs;
+  prefs.begin("launcher", false);
+  String saved = prefs.getString("sig", "");
+
+  // Gioco gia' in flash: avvio immediato
+  if (saved == sig) {
+    if (bootGame()) return;
+    // l'immagine in flash non e' valida: forzo una nuova copia al prossimo avvio
+    prefs.putString("sig", "");
+    prefs.end();
+    ESP.restart();
+    return;
+  }
+
+  // Gioco nuovo o cambiato: copia in flash
+  prefs.putString("sig", "");
+
+  String name = path.substring(1);
+  if (!copyToFlash(path, size, name)) {
+    prefs.end();
+    return;
+  }
+
+  prefs.putString("sig", sig);
+  prefs.end();
+
+  if (!bootGame()) {
+    showError("Avvio del gioco fallito");
+  }
 }
 
 void loop() {
