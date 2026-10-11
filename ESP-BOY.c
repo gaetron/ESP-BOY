@@ -1,12 +1,11 @@
 // ESP-BOY LAUNCHER - lancia il .bin presente sulla SD, senza menu
-// Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD, Update, Preferences sono nel core ESP32)
+// Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD e Update sono nel core ESP32)
 // Strumenti > Partition Scheme: "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"
 // Il launcher si carica UNA volta via USB. I giochi vanno compilati con lo stesso schema.
 
 #include <SPI.h>
 #include <SD.h>
 #include <Update.h>
-#include <Preferences.h>
 #include "esp_ota_ops.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -37,6 +36,10 @@ EspBoyTFT tft(TFT_CS, TFT_DC, TFT_RST);
 #define COLOR_TXT  ILI9341_GREEN
 #define COLOR_MSG  ILI9341_WHITE
 #define COLOR_ERR  ILI9341_RED
+
+// Tipo di ritorno di copyToFlash(): definito PRIMA delle funzioni,
+// altrimenti i prototipi generati dall'IDE non lo conoscono.
+enum CopyResult { COPY_OK, COPY_NO_MARKER, COPY_FAILED };
 
 // ---------------------------------------------------------------
 // Schermate
@@ -86,7 +89,7 @@ void drawBootScreen(const char* msg) {
   }
 }
 
-void showError(const String& msg) {
+void showErrorHint(const String& msg, const char* hint) {
   tft.fillScreen(COLOR_BG);
   tft.setTextWrap(false);
 
@@ -102,7 +105,11 @@ void showError(const String& msg) {
 
   tft.setTextColor(COLOR_TXT);
   tft.setCursor(10, 130);
-  tft.print("Spegni e riaccendi per riprovare");
+  tft.print(hint);
+}
+
+void showError(const String& msg) {
+  showErrorHint(msg, "Spegni e riaccendi per riprovare");
 }
 
 const int BAR_X = 20;
@@ -202,46 +209,70 @@ String updateErrorText() {
   return String(Update.errorString());
 }
 
-bool copyToFlash(const String& path, size_t size, const String& name) {
+// Marcatore che ogni gioco deve contenere (vedi blocco "ritorno al launcher").
+// Se manca, il gioco non rimetterebbe il launcher come avvio e resterebbe
+// bloccato: in quel caso il launcher lo rifiuta senza mai impostarlo come boot.
+static const char MARK[] = "ESPBOY_RETURN_V1";
+static const size_t MARK_LEN = sizeof(MARK) - 1;
+static const size_t CHUNK = 4096;
+
+CopyResult copyToFlash(const String& path, size_t size, const String& name) {
   File f = SD.open(path);
   if (!f) {
     showError("Impossibile leggere il file");
-    return false;
+    return COPY_FAILED;
   }
 
   if (!Update.begin(size)) {
     String msg = updateErrorText();
     f.close();
     showError(msg);
-    return false;
+    return COPY_FAILED;
   }
 
   drawProgressFrame(name);
   drawProgress(0);
 
-  static uint8_t buf[4096];
+  // I primi (MARK_LEN - 1) byte del buffer conservano la coda del blocco
+  // precedente, cosi' il marcatore viene trovato anche a cavallo di due blocchi.
+  const size_t P = MARK_LEN - 1;
+  static uint8_t buf[MARK_LEN - 1 + CHUNK];
+  memset(buf, 0, sizeof(buf));
+
   size_t done = 0;
   int lastPct = 0;
+  bool found = false;
 
   while (done < size) {
     size_t remaining = size - done;
-    size_t toRead = remaining < sizeof(buf) ? remaining : sizeof(buf);
+    size_t toRead = remaining < CHUNK ? remaining : CHUNK;
 
-    size_t n = f.read(buf, toRead);
+    size_t n = f.read(buf + P, toRead);
     if (n == 0) {
       Update.abort();
       f.close();
       showError("Lettura SD interrotta");
-      return false;
+      return COPY_FAILED;
     }
 
-    if (Update.write(buf, n) != n) {
+    if (Update.write(buf + P, n) != n) {
       String msg = updateErrorText();
       Update.abort();
       f.close();
       showError(msg);
-      return false;
+      return COPY_FAILED;
     }
+
+    if (!found) {
+      size_t total = P + n;
+      for (size_t i = 0; i + MARK_LEN <= total; i++) {
+        if (memcmp(buf + i, MARK, MARK_LEN) == 0) {
+          found = true;
+          break;
+        }
+      }
+    }
+    memmove(buf, buf + n, P);
 
     done += n;
 
@@ -254,12 +285,19 @@ bool copyToFlash(const String& path, size_t size, const String& name) {
 
   f.close();
 
-  if (!Update.end(true)) {
-    showError(updateErrorText());
-    return false;
+  // Senza marcatore NON si conferma l'aggiornamento: la partizione di boot
+  // resta quella del launcher.
+  if (!found) {
+    Update.abort();
+    return COPY_NO_MARKER;
   }
 
-  return true;
+  if (!Update.end(true)) {
+    showError(updateErrorText());
+    return COPY_FAILED;
+  }
+
+  return COPY_OK;
 }
 
 // ---------------------------------------------------------------
@@ -290,6 +328,16 @@ void setup() {
   tft.setLandscapeNative();
   tft.fillScreen(COLOR_BG);
 
+  // Protezione: con uno schema di partizioni senza OTA la copia andrebbe a
+  // sovrascrivere il launcher stesso. In quel caso non si copia nulla.
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* other   = esp_ota_get_next_update_partition(NULL);
+  if (running == NULL || other == NULL || other->address == running->address) {
+    showErrorHint("Schema partizioni senza OTA",
+                  "Usa Minimal SPIFFS (1.9MB APP with OTA)");
+    return;
+  }
+
   if (!sdOk) {
     drawBootScreen("SD assente");
     return;
@@ -304,31 +352,19 @@ void setup() {
     return;
   }
 
-  Preferences prefs;
-  prefs.begin("launcher", false);
-  String saved = prefs.getString("sig", "");
-
-  // Gioco gia' in flash: avvio immediato
-  if (saved == sig) {
-    if (bootGame()) return;
-    // l'immagine in flash non e' valida: forzo una nuova copia al prossimo avvio
-    prefs.putString("sig", "");
-    prefs.end();
-    ESP.restart();
-    return;
-  }
-
-  // Gioco nuovo o cambiato: copia in flash
-  prefs.putString("sig", "");
-
+  // Ad ogni accensione il gioco viene riscaricato da zero, anche se e' lo stesso
   String name = path.substring(1);
-  if (!copyToFlash(path, size, name)) {
-    prefs.end();
+  CopyResult r = copyToFlash(path, size, name);
+
+  if (r == COPY_NO_MARKER) {
+    showErrorHint("Manca ESPBOY_RETURN_V1 nel gioco",
+                  "Aggiungi il blocco di ritorno e ricompila");
     return;
   }
 
-  prefs.putString("sig", sig);
-  prefs.end();
+  if (r == COPY_FAILED) {
+    return;
+  }
 
   if (!bootGame()) {
     showError("Avvio del gioco fallito");
