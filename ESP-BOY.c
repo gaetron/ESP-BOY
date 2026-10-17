@@ -60,7 +60,7 @@ void drawBootScreen(const char* msg) {
     "  \"right\": Pin(26),", "  \"left\":  Pin(14),", "  \"A\":     Pin(32),",
     "  \"B\":     Pin(33)", "}",
     "sd card reader = {", "  \"spi\": Pin(5)", "}",
-    "piezo = {", "  \"PWM\": Pin(7)", "}"
+    "piezo = {", "  \"PWM\": Pin(25)", "}"
   };
   const int colACount = sizeof(colA) / sizeof(colA[0]);
 
