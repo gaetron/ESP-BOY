@@ -18,6 +18,9 @@
 #define TFT_SPI_HZ 16000000
 #define SD_SPI_HZ  10000000
 
+// Richiesta del sideloader (percorso del .bin da avviare, una volta sola)
+#define SIDE_REQ "/SIDELOAD.REQ"
+
 // Esiti di findGame()
 #define FIND_ERROR  -1
 #define FIND_NONE    0
@@ -202,6 +205,33 @@ int findGame(String& path, size_t& size) {
   return FIND_NONE;
 }
 
+// Richiesta del sideloader: legge il percorso dal file /SIDELOAD.REQ e lo CANCELLA subito,
+// cosi' vale una sola volta (al prossimo avvio si torna al file di default).
+// Ritorna true se il .bin richiesto esiste.
+bool readSideloadRequest(String& path, size_t& size) {
+  if (!SD.exists(SIDE_REQ)) return false;
+
+  File f = SD.open(SIDE_REQ, FILE_READ);
+  if (!f) return false;
+  String p = f.readStringUntil('\n');
+  f.close();
+  p.trim();
+  SD.remove(SIDE_REQ);
+
+  if (p.length() == 0) return false;
+
+  File b = SD.open(p, FILE_READ);
+  if (!b) return false;
+  bool ok = !b.isDirectory();
+  size_t sz = b.size();
+  b.close();
+  if (!ok) return false;
+
+  path = p;
+  size = sz;
+  return true;
+}
+
 // ---------------------------------------------------------------
 // Copia SD -> flash (partizione OTA libera)
 // ---------------------------------------------------------------
@@ -321,7 +351,11 @@ void setup() {
 
   String path;
   size_t size = 0;
-  int found = findGame(path, size);
+  int found;
+
+  // prima la richiesta del sideloader (una volta sola), altrimenti il file di default
+  if (readSideloadRequest(path, size)) found = FIND_OK;
+  else found = findGame(path, size);
 
   if (found == FIND_ERROR) {
     drawBootScreen("Impossibile leggere la SD");
@@ -334,7 +368,7 @@ void setup() {
   }
 
   // Ad ogni accensione il file viene riscaricato da zero, anche se e' lo stesso
-  String name = path.substring(1);
+  String name = path.substring(path.lastIndexOf('/') + 1);
   if (!copyToFlash(path, size, name)) {
     return;
   }
