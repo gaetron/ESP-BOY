@@ -1,4 +1,7 @@
-// ESP-BOY LAUNCHER - legge il .bin sulla SD, lo riscarica ad ogni accensione e lo avvia
+// ESP-BOY LAUNCHER
+//legge il .bin sulla SD, lo riscarica ad ogni accensione e lo avvia
+// Sideloader: se esiste /SIDELOAD.REQ (scritta dal multitool) carica quel .bin UNA sola volta;
+// allo spegnimento/riaccensione la richiesta non c'e' piu' e riparte il file di default.
 // Librerie: Adafruit GFX Library, Adafruit ILI9341 (SD e Update sono nel core ESP32)
 // Strumenti > Partition Scheme: "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"
 
@@ -256,8 +259,14 @@ bool copyToFlash(const String& path, size_t size, const String& name) {
 
   if (!Update.begin(size)) {
     String msg = updateErrorText();
+    if (Update.getError() == UPDATE_ERROR_SIZE) {
+      // dimensione errata: mostra quanto pesa il file e quanto spazio c'e' nella partizione dei giochi
+      const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
+      msg = "File " + String((unsigned long)(size / 1024)) + " KB, spazio " +
+            String(slot ? (unsigned long)(slot->size / 1024) : 0UL) + " KB";
+    }
     f.close();
-    showError(msg);
+    showErrorHint(msg, name.c_str());   // sotto l'errore compare anche il nome del file
     return false;
   }
 
